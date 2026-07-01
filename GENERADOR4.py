@@ -378,14 +378,29 @@ elif opcion == "📅 Cronogramas Técnicos":
                 else:
                     st.error("Indica el nombre del programa y sube el Excel.")
 
+        HORAS_SEMANA = 40  # Base SENA: 40 horas de formación por semana
+
         c_sem, c_hrs = {}, {}
         if archivo_sel:
             df_t = pd.read_excel(archivo_sel)
-            for f in df_t['Fase'].unique():
-                st.write(f"**Fase: {f}**")
-                c1, c2 = st.columns(2)
-                c_sem[f] = c1.number_input(f"Semanas:", 1, 50, 4, key=f"s_{f}")
-                c_hrs[f] = c2.number_input(f"Horas:", 1, 2000, 40, key=f"h_{f}")
+            tiene_horas = 'Horas' in df_t.columns and df_t['Horas'].notna().any()
+
+            if tiene_horas:
+                st.caption(f"⏱️ Horas y semanas calculadas automáticamente ({HORAS_SEMANA} h/semana)")
+                horas_por_fase = df_t.groupby('Fase')['Horas'].sum(min_count=1)
+                for f in df_t['Fase'].unique():
+                    horas_f = int(horas_por_fase.get(f) or 0)
+                    semanas_f = max(1, math.ceil(horas_f / HORAS_SEMANA)) if horas_f > 0 else 1
+                    c_hrs[f] = horas_f
+                    c_sem[f] = semanas_f
+                    st.write(f"**{f}:** {horas_f} horas → {semanas_f} semanas")
+            else:
+                st.warning("Este programa no trae la columna 'Horas'; ingrésalas manualmente:")
+                for f in df_t['Fase'].unique():
+                    st.write(f"**Fase: {f}**")
+                    c1, c2 = st.columns(2)
+                    c_sem[f] = c1.number_input(f"Semanas:", 1, 50, 4, key=f"s_{f}")
+                    c_hrs[f] = c2.number_input(f"Horas:", 1, 2000, 40, key=f"h_{f}")
 
         f_ini_in = st.date_input("Inicio de Lectiva", date.today(), key="cr_date")
         inst_nom = st.text_input("Instructor Técnico", "Carlos Barrios", key="cr_inst")
