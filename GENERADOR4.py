@@ -5,6 +5,8 @@ from datetime import date, timedelta
 import math
 import os
 import io
+import base64
+import requests
 
 # ==========================================
 # 1. CONFIGURACIÓN GLOBAL Y ESTILOS
@@ -13,6 +15,27 @@ st.set_page_config(page_title="SENA Pro CIEA 2026", layout="wide")
 
 VERDE_SENA = "#39A900"
 LOGO_SENA_URL = "https://oficinavirtualderadicacion.sena.edu.co/oficinavirtual/Resources/logoSenaNaranja.png"
+
+# Carpeta donde se guardan los Excel de cada programa (uno por programa).
+# IMPORTANTE: en Streamlit Community Cloud este disco es EFÍMERO.
+# Para que los programas persistan de verdad, sube estos .xlsx directamente
+# al repositorio de GitHub dentro de esta misma carpeta.
+PROGRAMS_DIR = "programas_guardados"
+os.makedirs(PROGRAMS_DIR, exist_ok=True)
+
+# --- Configuración de GitHub (se define en .streamlit/secrets.toml o en
+#     "Settings > Secrets" de Streamlit Cloud). Si no está configurado, la
+#     app sigue funcionando pero solo con guardado local (no permanente). ---
+def _get_secret(key, default=""):
+    try:
+        return st.secrets.get(key, default)
+    except Exception:
+        return default
+
+GITHUB_REPO = _get_secret("GITHUB_REPO")      # ej: "cbarriosn/sena-pro-ciea"
+GITHUB_TOKEN = _get_secret("GITHUB_TOKEN")    # Personal Access Token con permiso Contents: Read/Write
+GITHUB_BRANCH = _get_secret("GITHUB_BRANCH", "main")
+GITHUB_PATH = PROGRAMS_DIR  # misma carpeta dentro del repo
 
 # Estilos para Botón 3D Verde y botones de acción
 st.markdown(f"""
@@ -61,6 +84,101 @@ def limpiar(t):
 
 def format_f(d): return d.strftime('%d/%m/%y')
 
+def github_configurado():
+    return bool(GITHUB_REPO and GITHUB_TOKEN)
+
+def _gh_headers():
+    return {"Authorization": f"token {GITHUB_TOKEN}", "Accept": "application/vnd.github+json"}
+
+def listar_programas_local():
+    """Escanea PROGRAMS_DIR (disco local/caché) y devuelve {nombre_visible: ruta_archivo}."""
+    programas = {}
+    for fname in sorted(os.listdir(PROGRAMS_DIR)):
+        if fname.lower().endswith(".xlsx"):
+            nombre_visible = fname[:-5].replace("_", " ").upper()
+            programas[nombre_visible] = os.path.join(PROGRAMS_DIR, fname)
+    return programas
+
+def listar_programas_github():
+    """Consulta la carpeta programas_guardados/ en GitHub.
+    Devuelve {nombre_visible: item_json_de_github} o {} si falla/no existe aún."""
+    programas = {}
+    if not github_configurado():
+        return programas
+    url = f"https://api.github.com/repos/{GITHUB_REPO}/contents/{GITHUB_PATH}"
+    try:
+        r = requests.get(url, headers=_gh_headers(), params={"ref": GITHUB_BRANCH}, timeout=10)
+        if r.status_code == 200:
+            for item in r.json():
+                if item["name"].lower().endswith(".xlsx"):
+                    nombre_visible = item["name"][:-5].replace("_", " ").upper()
+                    programas[nombre_visible] = item
+        elif r.status_code != 404:  # 404 = la carpeta aún no existe en el repo, es normal al inicio
+            st.sidebar.error(f"⚠️ GitHub respondió {r.status_code} al listar programas.")
+    except requests.exceptions.RequestException as e:
+        st.sidebar.error(f"⚠️ No se pudo conectar a GitHub: {e}")
+    return programas
+
+def descargar_programa_github(item_github, destino_local):
+    """Descarga el contenido de un archivo de GitHub y lo cachea en disco local."""
+    r = requests.get(item_github["download_url"], headers=_gh_headers(), timeout=15)
+    r.raise_for_status()
+    with open(destino_local, "wb") as f:
+        f.write(r.content)
+    return destino_local
+
+def subir_programa_github(nombre_archivo, contenido_bytes):
+    """Crea o actualiza (si ya existe) el archivo en GitHub vía la Contents API.
+    Devuelve (ok: bool, mensaje: str)."""
+    if not github_configurado():
+        return False, "GitHub no está configurado (faltan GITHUB_REPO / GITHUB_TOKEN en secrets)."
+
+    ruta_repo = f"{GITHUB_PATH}/{nombre_archivo}"
+    url = f"https://api.github.com/repos/{GITHUB_REPO}/contents/{ruta_repo}"
+
+    # Si el archivo ya existe en el repo, GitHub exige mandar su "sha" para poder actualizarlo
+    sha_existente = None
+    try:
+        r_check = requests.get(url, headers=_gh_headers(), params={"ref": GITHUB_BRANCH}, timeout=10)
+        if r_check.status_code == 200:
+            sha_existente = r_check.json().get("sha")
+    except requests.exceptions.RequestException:
+        pass
+
+    payload = {
+        "message": f"Agregar/actualizar programa: {nombre_archivo}",
+        "content": base64.b64encode(contenido_bytes).decode("utf-8"),
+        "branch": GITHUB_BRANCH,
+    }
+    if sha_existente:
+        payload["sha"] = sha_existente
+
+    try:
+        r = requests.put(url, headers=_gh_headers(), json=payload, timeout=20)
+        if r.status_code in (200, 201):
+            return True, "OK"
+        return False, f"HTTP {r.status_code}: {r.json().get('message', 'Error desconocido')}"
+    except requests.exceptions.RequestException as e:
+        return False, str(e)
+
+def obtener_programas_disponibles():
+    """Fuente única de verdad para el selectbox.
+    Si GitHub está configurado, lo usa como fuente principal (persistente).
+    Si no, cae de nuevo al listado local (solo dura mientras la app esté viva)."""
+    disponibles = {}
+    if github_configurado():
+        for nombre, item in listar_programas_github().items():
+            disponibles[nombre] = {"tipo": "github", "item": item, "local_path": os.path.join(PROGRAMS_DIR, item["name"])}
+    else:
+        for nombre, path in listar_programas_local().items():
+            disponibles[nombre] = {"tipo": "local", "local_path": path}
+    return disponibles
+
+def slug_archivo(nombre):
+    """Convierte un nombre de programa en un nombre de archivo seguro."""
+    limpio = limpiar(nombre).strip()
+    return "".join(c if c.isalnum() else "_" for c in limpio).strip("_") or "PROGRAMA"
+
 # ==========================================
 # 3. MENÚ DE NAVEGACIÓN LATERAL
 # ==========================================
@@ -77,7 +195,7 @@ with st.sidebar:
 # ==========================================
 if opcion == "📢 Anuncios para Zajuna":
     st.markdown(f"<h1 class='title-ciea'>🌿 Generador de Anuncios Institucionales</h1>", unsafe_allow_html=True)
-    
+
     with st.sidebar:
         st.header("⚙️ Ajustes del Anuncio")
         tipo = st.selectbox("Categoría:", ["1. Bienvenida y Presentación", "2. Información General / Cambios", "3. Evidencias y Actividades", "4. Sondeos, Evaluaciones y Recursos", "5. Recordatorio de Fechas / Cronograma", "6. Orientaciones y Aclaraciones", "7. Sesión en Línea (Sincrónica)", "8. Cuadro de Honor (Felicitaciones)"])
@@ -135,7 +253,7 @@ if opcion == "📢 Anuncios para Zajuna":
 # ==========================================
 elif opcion == "📅 Cronogramas Técnicos":
     st.markdown(f"<h1 class='title-ciea'>📅 Cronogramas con Identidad CIEA</h1>", unsafe_allow_html=True)
-    
+
     # --- FUNCIONES CRONOGRAMA ---
     def proximo_valido(f, festivs, vaca_activa):
         cursor = f
@@ -159,7 +277,7 @@ elif opcion == "📅 Cronogramas Técnicos":
             fmt_m = wb.add_format({'align': 'center', 'valign': 'vcenter', 'border': 1, 'text_wrap': True, 'font_size': 9})
             if os.path.exists("logo_sena.png"): ws.insert_image('A1', 'logo_sena.png', {'x_scale': 0.15, 'y_scale': 0.15})
             ws.merge_range('C1:I1', 'CENTRO INDUSTRIAL Y DE ENERGIAS ALTERNATIVAS - REGIONAL GUAJIRA', wb.add_format({'bold': True, 'size': 12, 'align': 'center'}))
-            ws.merge_range('C2:I2', f'PROGRAMA: {programa}', wb.add_format({'bold': True, 'align': 'center'}))      
+            ws.merge_range('C2:I2', f'PROGRAMA: {programa}', wb.add_format({'bold': True, 'align': 'center'}))
             ws.merge_range('C3:I3', 'CRONOGRAMA GENERAL', wb.add_format({'bold': True, 'size': 11,'align': 'center'}))
             for col, val in enumerate(df_export.columns): ws.write(4, col, val, fmt_h)
             ws.write('H5', 'Duración (Hrs)', fmt_h); ws.write('I5', 'Fechas Fase', fmt_h)
@@ -199,7 +317,7 @@ elif opcion == "📅 Cronogramas Técnicos":
             txts = [limpiar(r['Fase']), limpiar(r['Actividad_Proyecto']), limpiar(r['Actividad_Aprendizaje']), limpiar(r['RAP']), limpiar(r['Evidencia']), limpiar(r['Instructor']), format_f(r['Inicio']), format_f(r['Fin'])]
             # Cálculo de altura de fila para que NO se monten las celdas
             h_row = max(max([pdf.get_string_width(t) / (w[i]-2) for i, t in enumerate(txts)]), 1) * 4
-            h_row = max(h_row, 8) 
+            h_row = max(h_row, 8)
             if pdf.get_y() + h_row > 180: pdf.add_page()
             y_a = pdf.get_y()
             for i, t in enumerate(txts):
@@ -208,23 +326,74 @@ elif opcion == "📅 Cronogramas Técnicos":
             pdf.set_y(y_a + h_row)
         return pdf.output(dest='S').encode('latin-1')
 
+    # --- SELECCIÓN DE PROGRAMA (reemplaza el file_uploader manual) ---
     with st.sidebar:
-        archivo = st.file_uploader("Suba su Excel (Fase, AP, AA, RAP, Evidencia)", type=["xlsx"], key="cr_file")
+        st.markdown("#### 📂 Programa de Formación")
+
+        if github_configurado():
+            st.caption("🔗 Conectado a GitHub — los programas quedan guardados de forma permanente.")
+        else:
+            st.caption("⚠️ GitHub no configurado — los programas solo duran mientras la app esté activa.")
+
+        programas_disp = obtener_programas_disponibles()
+
+        if not programas_disp:
+            st.warning("No hay programas registrados todavía. Agrega uno en '➕ Agregar Programa' abajo.")
+            archivo_sel = None
+            nombre_prog_sel = None
+        else:
+            nombre_prog_sel = st.selectbox("Seleccione el programa:", list(programas_disp.keys()), key="cr_prog_select")
+            info_sel = programas_disp[nombre_prog_sel]
+            archivo_sel = info_sel["local_path"]
+            # Si viene de GitHub y no está cacheado localmente todavía, se descarga una vez
+            if info_sel["tipo"] == "github" and not os.path.exists(archivo_sel):
+                with st.spinner(f"Descargando '{nombre_prog_sel}' desde GitHub..."):
+                    descargar_programa_github(info_sel["item"], archivo_sel)
+
+        with st.expander("➕ Agregar / Actualizar Programa"):
+            st.caption("Súbelo una sola vez. Desde entonces aparecerá siempre en la lista.")
+            nuevo_nombre = st.text_input("Nombre del programa", placeholder="Ej: Coordinación Procesos Logísticos", key="cr_new_name")
+            nuevo_archivo = st.file_uploader("Excel del programa (Fase, AP, AA, RAP, Evidencia)", type=["xlsx"], key="cr_new_file")
+            if st.button("💾 Guardar Programa", key="cr_save_prog"):
+                if nuevo_nombre and nuevo_archivo:
+                    nombre_archivo = slug_archivo(nuevo_nombre) + ".xlsx"
+                    contenido_bytes = nuevo_archivo.getbuffer().tobytes()
+
+                    # 1) Guardar en caché local (para poder usarlo de inmediato con pandas)
+                    with open(os.path.join(PROGRAMS_DIR, nombre_archivo), "wb") as f:
+                        f.write(contenido_bytes)
+
+                    # 2) Subir a GitHub si está configurado (esto es lo que lo hace permanente)
+                    if github_configurado():
+                        with st.spinner("Subiendo a GitHub..."):
+                            ok, msg = subir_programa_github(nombre_archivo, contenido_bytes)
+                        if ok:
+                            st.success(f"✅ '{nuevo_nombre}' guardado y subido a GitHub. Quedará disponible siempre.")
+                        else:
+                            st.warning(f"Se guardó localmente por ahora, pero falló la subida a GitHub: {msg}")
+                    else:
+                        st.info(f"✅ '{nuevo_nombre}' guardado localmente. Configura GITHUB_TOKEN en Secrets para que sea permanente.")
+
+                    st.rerun()
+                else:
+                    st.error("Indica el nombre del programa y sube el Excel.")
+
         c_sem, c_hrs = {}, {}
-        if archivo:
-            df_t = pd.read_excel(archivo)
+        if archivo_sel:
+            df_t = pd.read_excel(archivo_sel)
             for f in df_t['Fase'].unique():
                 st.write(f"**Fase: {f}**")
                 c1, c2 = st.columns(2)
                 c_sem[f] = c1.number_input(f"Semanas:", 1, 50, 4, key=f"s_{f}")
                 c_hrs[f] = c2.number_input(f"Horas:", 1, 2000, 40, key=f"h_{f}")
+
         f_ini_in = st.date_input("Inicio de Lectiva", date.today(), key="cr_date")
         inst_nom = st.text_input("Instructor Técnico", "Carlos Barrios", key="cr_inst")
         vaca_tog = st.toggle("Omitir Vacaciones", value=True)
         festivs_list = st.multiselect("Festivos:", pd.date_range(start=date.today(), periods=365).date.tolist())
 
-    if archivo:
-        df_raw = pd.read_excel(archivo)
+    if archivo_sel:
+        df_raw = pd.read_excel(archivo_sel)
         if st.button("🚀 PROCESAR CRONOGRAMA"):
             res = []; cursor = f_ini_in
             for f in df_raw['Fase'].unique():
@@ -239,7 +408,9 @@ elif opcion == "📅 Cronogramas Técnicos":
                         item.update({"Inicio": f_i_s, "Fin": f_f_s, "Instructor": asignar_instructor(item['Actividad_Aprendizaje'], inst_nom)})
                         res.append(item)
                     cursor = f_f_s + timedelta(days=1)
-            st.session_state.crono = res; st.session_state.horas = c_hrs; st.session_state.prog = archivo.name.split('.')[0].upper()
+            st.session_state.crono = res
+            st.session_state.horas = c_hrs
+            st.session_state.prog = nombre_prog_sel
 
     if 'crono' in st.session_state:
         st.dataframe(pd.DataFrame(st.session_state.crono), use_container_width=True)
@@ -247,7 +418,7 @@ elif opcion == "📅 Cronogramas Técnicos":
         col1, col2 = st.columns(2)
         with col1:
             ex_gen = generar_excel_general_pro(st.session_state.crono, st.session_state.prog, st.session_state.horas)
-            st.download_button("📥 EXCEL GENERAL (.XLSX)", data=ex_gen, file_name=f"Cronograma_{st.session_state.prog}.xlsx")
+            st.download_button("📥 EXCEL GENERAL (.XLSX)", data=ex_gen, file_name=f"Cronograma_{slug_archivo(st.session_state.prog)}.xlsx")
         with col2:
             st.write("📄 **PDFs por Fase:**")
             df_r = pd.DataFrame(st.session_state.crono)
@@ -255,4 +426,4 @@ elif opcion == "📅 Cronogramas Técnicos":
             for f in fases:
                 df_f = [x for x in st.session_state.crono if x['Fase'] == f]
                 pdf_f = generar_pdf_fase_ciea(df_f, st.session_state.prog, f)
-                st.download_button(f"Fase {f}", data=pdf_f, file_name=f"Fase_{f}.pdf")
+                st.download_button(f"Fase {f}", data=pdf_f, file_name=f"Fase_{slug_archivo(str(f))}.pdf", key=f"dl_{f}")
