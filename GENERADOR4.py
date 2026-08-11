@@ -179,6 +179,90 @@ def slug_archivo(nombre):
     limpio = limpiar(nombre).strip()
     return "".join(c if c.isalnum() else "_" for c in limpio).strip("_") or "PROGRAMA"
 
+# --- Normalización de Excels de programas ---
+# Cada programa puede venir con encabezados distintos (minúsculas, nombres
+# largos del formato oficial SENA, celdas fusionadas que dejan huecos, etc).
+# Esto evita que la app se caiga con KeyError cada vez que un Excel no viene
+# exactamente con las columnas que el resto del código espera.
+_SINONIMOS_COLUMNAS = {
+    "FASE": "Fase", "NOMBRE DE LA FASE": "Fase", "NOMBRE FASE": "Fase",
+    "AP": "Actividad_Proyecto", "ACTIVIDAD_PROYECTO": "Actividad_Proyecto",
+    "ACTIVIDAD DEL PROYECTO": "Actividad_Proyecto", "ACTIVIDAD PROYECTO": "Actividad_Proyecto",
+    "AA": "Actividad_Aprendizaje", "ACTIVIDAD_APRENDIZAJE": "Actividad_Aprendizaje",
+    "ACTIVIDAD DE APRENDIZAJE": "Actividad_Aprendizaje", "ACTIVIDAD APRENDIZAJE": "Actividad_Aprendizaje",
+    "RAP": "RAP", "RESULTADO DE APRENDIZAJE": "RAP", "RESULTADOS DE APRENDIZAJE": "RAP",
+    "RESULTADO APRENDIZAJE": "RAP",
+    "EVIDENCIA": "Evidencia", "EVIDENCIAS": "Evidencia",
+    "EVIDENCIAS DE APRENDIZAJE": "Evidencia", "EVIDENCIA DE APRENDIZAJE": "Evidencia",
+    "HORAS": "Horas", "HORAS PLANEADAS": "Horas", "HORAS DE FORMACION": "Horas",
+}
+_COLUMNAS_TEXTO = ["Fase", "Actividad_Proyecto", "Actividad_Aprendizaje", "RAP", "Evidencia"]
+_COLUMNAS_REQUERIDAS = ["Fase", "Actividad_Proyecto", "Actividad_Aprendizaje", "RAP", "Evidencia"]
+
+def _espacios_limpios(x):
+    """Colapsa espacios/nbsp repetidos que dejan las celdas fusionadas de Excel."""
+    if pd.isna(x):
+        return x
+    return " ".join(str(x).replace("\xa0", " ").split())
+
+def normalizar_programa(df):
+    """Adapta cualquier Excel de programa al esquema interno de la app (Fase,
+    Actividad_Proyecto, Actividad_Aprendizaje, RAP, Evidencia y Horas opcional),
+    sin importar mayúsculas/minúsculas, nombres largos del formato oficial SENA,
+    o celdas fusionadas que dejan huecos en las filas de abajo.
+    Devuelve (df_normalizado, columnas_faltantes); si faltan columnas, df es None."""
+    df = df.rename(columns=lambda c: " ".join(limpiar(str(c)).strip().upper().split()))
+    df = df.rename(columns={c: _SINONIMOS_COLUMNAS[c] for c in df.columns if c in _SINONIMOS_COLUMNAS})
+    df = df.loc[:, ~df.columns.duplicated()]
+
+    faltantes = [c for c in _COLUMNAS_REQUERIDAS if c not in df.columns]
+    if faltantes:
+        return None, faltantes
+
+    for col in _COLUMNAS_TEXTO:
+        df[col] = df[col].apply(_espacios_limpios)
+
+    # Filas "espaciador": el Excel original fusionó el nombre de la fase en dos
+    # bloques verticales (ej. "Fase 2." arriba y "Planeación" como fila aparte,
+    # sin ningún otro dato). Se pegan al texto de Fase de la fila anterior.
+    contenido_cols = [c for c in ["Actividad_Proyecto", "Actividad_Aprendizaje", "RAP", "Evidencia"] if c in df.columns]
+    es_espaciador = df[contenido_cols].isna().all(axis=1) & df["Fase"].notna()
+    for idx in df.index[es_espaciador]:
+        pos = df.index.get_loc(idx)
+        if pos > 0:
+            anterior = df.index[pos - 1]
+            texto_extra = str(df.at[idx, "Fase"]).strip()
+            texto_prev = df.at[anterior, "Fase"]
+            if pd.notna(texto_prev):
+                df.at[anterior, "Fase"] = f"{str(texto_prev).strip()} {texto_extra}".strip()
+    df = df.drop(index=df.index[es_espaciador])
+
+    # Celdas fusionadas verticalmente solo guardan el valor en la primera fila
+    # del bloque y dejan vacías las siguientes -> se rellenan hacia abajo.
+    for col in ["Fase", "Actividad_Proyecto", "Actividad_Aprendizaje", "RAP"]:
+        df[col] = df[col].ffill()
+
+    # Filas basura sin Fase real (subencabezados sueltos) o sin Evidencia.
+    df = df.dropna(subset=["Fase", "Evidencia"]).reset_index(drop=True)
+
+    # 'Horas' solo cuenta si de verdad trae números; si trae texto (ej. "768 horas")
+    # es mejor ignorarla y pedirla a mano que calcular horas/semanas mal.
+    if "Horas" in df.columns:
+        df["Horas"] = pd.to_numeric(df["Horas"], errors="coerce")
+
+    columnas_finales = [c for c in ["Fase", "Actividad_Proyecto", "Actividad_Aprendizaje", "RAP", "Evidencia", "Horas"] if c in df.columns]
+    return df[columnas_finales].reset_index(drop=True), []
+
+def cargar_programa(ruta_excel):
+    """Lee y normaliza el Excel de un programa.
+    Devuelve (df_o_None, columnas_faltantes, columnas_originales_o_None, error_lectura_o_None)."""
+    try:
+        df_original = pd.read_excel(ruta_excel)
+    except Exception as e:
+        return None, [], None, str(e)
+    df_norm, faltantes = normalizar_programa(df_original)
+    return df_norm, faltantes, list(df_original.columns), None
+
 # ==========================================
 # 3. MENÚ DE NAVEGACIÓN LATERAL
 # ==========================================
@@ -381,38 +465,53 @@ elif opcion == "📅 Cronogramas Técnicos":
         HORAS_SEMANA = 40  # Base SENA: 40 horas de formación por semana
 
         c_sem, c_hrs = {}, {}
+        df_t = None
         if archivo_sel:
-            df_t = pd.read_excel(archivo_sel)
-            tiene_horas = 'Horas' in df_t.columns and df_t['Horas'].notna().any()
+            df_t, faltantes, cols_orig, error_lectura = cargar_programa(archivo_sel)
 
-            if tiene_horas:
-                st.caption(f"⏱️ Horas y semanas calculadas automáticamente ({HORAS_SEMANA} h/semana)")
-                horas_por_fase = df_t.groupby('Fase')['Horas'].sum(min_count=1)
-                for f in df_t['Fase'].unique():
-                    horas_f = int(horas_por_fase.get(f) or 0)
-                    semanas_f = max(1, math.ceil(horas_f / HORAS_SEMANA)) if horas_f > 0 else 1
-                    c_hrs[f] = horas_f
-                    c_sem[f] = semanas_f
-                    st.write(f"**{f}:** {horas_f} horas → {semanas_f} semanas")
+            if error_lectura:
+                st.error(f"⚠️ No se pudo leer el Excel de '{nombre_prog_sel}': {error_lectura}")
+                df_t = None
+            elif faltantes:
+                st.error(
+                    f"⚠️ El Excel de **{nombre_prog_sel}** no tiene las columnas que la app necesita.\n\n"
+                    f"**Faltan:** {', '.join(faltantes)}\n\n"
+                    f"**Columnas encontradas en el archivo:** {', '.join(str(c) for c in cols_orig)}\n\n"
+                    "Revisa los encabezados del Excel — necesita algo equivalente a Fase, "
+                    "Actividad del Proyecto, Actividad de Aprendizaje, RAP y Evidencia "
+                    "(cualquier variación razonable de mayúsculas o nombre funciona)."
+                )
+                df_t = None
             else:
-                st.warning("Este programa no trae la columna 'Horas'; ingrésalas manualmente:")
-                for f in df_t['Fase'].unique():
-                    st.write(f"**Fase: {f}**")
-                    c1, c2 = st.columns(2)
-                    c_sem[f] = c1.number_input(f"Semanas:", 1, 50, 4, key=f"s_{f}")
-                    c_hrs[f] = c2.number_input(f"Horas:", 1, 2000, 40, key=f"h_{f}")
+                tiene_horas = 'Horas' in df_t.columns and df_t['Horas'].notna().any()
+
+                if tiene_horas:
+                    st.caption(f"⏱️ Horas y semanas calculadas automáticamente ({HORAS_SEMANA} h/semana)")
+                    horas_por_fase = df_t.groupby('Fase')['Horas'].sum(min_count=1)
+                    for f in df_t['Fase'].unique():
+                        horas_f = int(horas_por_fase.get(f) or 0)
+                        semanas_f = max(1, math.ceil(horas_f / HORAS_SEMANA)) if horas_f > 0 else 1
+                        c_hrs[f] = horas_f
+                        c_sem[f] = semanas_f
+                        st.write(f"**{f}:** {horas_f} horas → {semanas_f} semanas")
+                else:
+                    st.warning("Este programa no trae la columna 'Horas'; ingrésalas manualmente:")
+                    for f in df_t['Fase'].unique():
+                        st.write(f"**Fase: {f}**")
+                        c1, c2 = st.columns(2)
+                        c_sem[f] = c1.number_input(f"Semanas:", 1, 50, 4, key=f"s_{f}")
+                        c_hrs[f] = c2.number_input(f"Horas:", 1, 2000, 40, key=f"h_{f}")
 
         f_ini_in = st.date_input("Inicio de Lectiva", date.today(), key="cr_date")
         inst_nom = st.text_input("Instructor Técnico", "Carlos Barrios", key="cr_inst")
         vaca_tog = st.toggle("Omitir Vacaciones", value=True)
         festivs_list = st.multiselect("Festivos:", pd.date_range(start=date.today(), periods=365).date.tolist())
 
-    if archivo_sel:
-        df_raw = pd.read_excel(archivo_sel)
+    if archivo_sel and df_t is not None:
         if st.button("🚀 PROCESAR CRONOGRAMA"):
             res = []; cursor = f_ini_in
-            for f in df_raw['Fase'].unique():
-                items = df_raw[df_raw['Fase'] == f].to_dict('records')
+            for f in df_t['Fase'].unique():
+                items = df_t[df_t['Fase'] == f].to_dict('records')
                 sem = c_sem[f]; avg = len(items)/sem; idx = 0
                 for s in range(sem):
                     count = math.ceil((s+1)*avg) - math.ceil(s*avg)
