@@ -362,6 +362,57 @@ elif opcion == "📅 Cronogramas Técnicos":
             cursor = siguiente
         return cursor
 
+    def es_dia_habil(f, festivs, vaca_activa):
+        """True si 'f' es lunes-viernes, no festivo, y no cae en el receso de vacaciones."""
+        if f.weekday() >= 5 or f in festivs:
+            return False
+        if vaca_activa and ((f.month == 12 and f.day >= 15) or (f.month == 1) or (f.month == 2 and f.day <= 2)):
+            return False
+        return True
+
+    def contar_dias_habiles(inicio, fin, festivs, vaca_activa):
+        """Cuenta los días hábiles entre 'inicio' y 'fin', inclusive."""
+        total = 0; cursor = inicio
+        while cursor <= fin:
+            if es_dia_habil(cursor, festivs, vaca_activa):
+                total += 1
+            cursor += timedelta(days=1)
+        return total
+
+    def repartir_semanas(pesos, total_semanas):
+        """Reparte 'total_semanas' (entero) entre las fases de 'pesos' (dict fase->peso),
+        proporcional al peso de cada una, con al menos 1 semana por fase cuando alcanza
+        (método de residuo mayor, para que la suma cuadre exacto con total_semanas)."""
+        fases = list(pesos.keys()); n = len(fases)
+        if total_semanas <= n:
+            return {f: 1 for f in fases}  # no alcanza para repartir proporcional; al menos 1 c/u (nunca 0, para no perder contenido)
+        peso_total = sum(pesos.values()) or 1
+        exactos = {f: (pesos[f] / peso_total) * total_semanas for f in fases}
+        base = {f: max(1, math.floor(exactos[f])) for f in fases}
+        sobra = total_semanas - sum(base.values())
+        orden = sorted(fases, key=lambda f: exactos[f] - math.floor(exactos[f]), reverse=True)
+        i = 0
+        while sobra > 0:
+            base[orden[i % n]] += 1; sobra -= 1; i += 1
+        i = 0
+        while sobra < 0:
+            f = orden[-1 - (i % n)]
+            if base[f] > 1:
+                base[f] -= 1; sobra += 1
+            i += 1
+        return base
+
+    def fecha_fin_de(inicio, total_semanas, festivs, vaca_activa):
+        """Simula el reparto semana a semana (igual que el procesamiento real) y devuelve
+        la fecha en que terminaría la última semana."""
+        cursor = inicio
+        f_f = inicio
+        for _ in range(total_semanas):
+            cursor = proximo_valido(cursor, festivs, vaca_activa)
+            f_f = sumar_dias_habiles(cursor, 4, festivs, vaca_activa)
+            cursor = f_f + timedelta(days=1)
+        return f_f
+
     def generar_excel_general_pro(datos, programa, horas_dict):
         output = io.BytesIO()
         df = pd.DataFrame(datos)
@@ -478,6 +529,18 @@ elif opcion == "📅 Cronogramas Técnicos":
 
         HORAS_SEMANA = 40  # Base SENA: 40 horas de formación por semana
 
+        f_ini_in = st.date_input("Inicio de Lectiva", date.today(), key="cr_date")
+        inst_nom = st.text_input("Instructor Técnico", "Carlos Barrios", key="cr_inst")
+        vaca_tog = st.toggle("Omitir Vacaciones", value=True)
+        festivs_list = st.multiselect("Festivos:", pd.date_range(start=date.today(), periods=365).date.tolist())
+
+        st.markdown("---")
+        usar_fecha_fin = st.toggle("📅 Repartir semanas para calzar con una fecha fin fija", value=False, key="cr_usar_fin")
+        fecha_fin_obj = None
+        if usar_fecha_fin:
+            fecha_fin_obj = st.date_input("Fecha fin del programa", f_ini_in + timedelta(days=365), key="cr_fecha_fin", min_value=f_ini_in)
+        st.markdown("---")
+
         c_sem, c_hrs = {}, {}
         df_t = None
         if archivo_sel:
@@ -499,27 +562,52 @@ elif opcion == "📅 Cronogramas Técnicos":
             else:
                 tiene_horas = 'Horas' in df_t.columns and df_t['Horas'].notna().any()
 
+                # peso de cada fase para repartir proporcionalmente: horas reales si las hay,
+                # si no, cantidad de actividades (RAP) como referencia de tamaño relativo
                 if tiene_horas:
-                    st.caption(f"⏱️ Horas y semanas calculadas automáticamente ({HORAS_SEMANA} h/semana)")
                     horas_por_fase = df_t.groupby('Fase')['Horas'].sum(min_count=1)
+                    pesos = {f: int(horas_por_fase.get(f) or 0) for f in df_t['Fase'].unique()}
+                else:
+                    pesos = {f: len(df_t[df_t['Fase'] == f]) for f in df_t['Fase'].unique()}
+
+                semanas_auto = None
+                if usar_fecha_fin and fecha_fin_obj:
+                    dias_disp = contar_dias_habiles(f_ini_in, fecha_fin_obj, festivs_list, vaca_tog)
+                    semanas_disp = max(1, round(dias_disp / 5))
+                    semanas_auto = repartir_semanas(pesos, semanas_disp)
+                    st.caption(f"📆 {dias_disp} días hábiles disponibles ≈ {semanas_disp} semanas — repartidas según el tamaño de cada fase, editable abajo.")
+                    if semanas_disp < len(pesos):
+                        st.warning("El rango de fechas es más corto que la cantidad de fases: no alcanza ni 1 semana por fase.")
+
+                if tiene_horas and not usar_fecha_fin:
+                    st.caption(f"⏱️ Horas y semanas calculadas automáticamente ({HORAS_SEMANA} h/semana)")
                     for f in df_t['Fase'].unique():
-                        horas_f = int(horas_por_fase.get(f) or 0)
+                        horas_f = pesos[f]
                         semanas_f = max(1, math.ceil(horas_f / HORAS_SEMANA)) if horas_f > 0 else 1
                         c_hrs[f] = horas_f
                         c_sem[f] = semanas_f
                         st.write(f"**{f}:** {horas_f} horas → {semanas_f} semanas")
                 else:
-                    st.warning("Este programa no trae la columna 'Horas'; ingrésalas manualmente:")
+                    if not tiene_horas and not usar_fecha_fin:
+                        st.warning("Este programa no trae la columna 'Horas'; ingrésalas manualmente:")
                     for f in df_t['Fase'].unique():
                         st.write(f"**Fase: {f}**")
                         c1, c2 = st.columns(2)
-                        c_sem[f] = c1.number_input(f"Semanas:", 1, 50, 4, key=f"s_{f}")
-                        c_hrs[f] = c2.number_input(f"Horas:", 1, 2000, 40, key=f"h_{f}")
+                        semanas_default = semanas_auto[f] if semanas_auto else 4
+                        horas_default = pesos[f] if tiene_horas else semanas_default * HORAS_SEMANA
+                        c_sem[f] = c1.number_input("Semanas:", 1, 100, max(1, int(semanas_default)), key=f"s_{f}")
+                        c_hrs[f] = c2.number_input("Horas:", 1, 4000, max(1, int(horas_default)), key=f"h_{f}")
 
-        f_ini_in = st.date_input("Inicio de Lectiva", date.today(), key="cr_date")
-        inst_nom = st.text_input("Instructor Técnico", "Carlos Barrios", key="cr_inst")
-        vaca_tog = st.toggle("Omitir Vacaciones", value=True)
-        festivs_list = st.multiselect("Festivos:", pd.date_range(start=date.today(), periods=365).date.tolist())
+                if c_sem and sum(c_sem.values()) > 0:
+                    fin_estimado = fecha_fin_de(f_ini_in, sum(c_sem.values()), festivs_list, vaca_tog)
+                    if usar_fecha_fin and fecha_fin_obj:
+                        diff = (fin_estimado - fecha_fin_obj).days
+                        if abs(diff) <= 5:
+                            st.success(f"✅ Con esta distribución el cronograma cierra el {format_f(fin_estimado)} — calza con tu fecha objetivo ({format_f(fecha_fin_obj)}).")
+                        else:
+                            st.warning(f"⚠️ Con esta distribución el cronograma cierra el {format_f(fin_estimado)}; tu objetivo era {format_f(fecha_fin_obj)} ({abs(diff)} días de diferencia). Ajusta las semanas manualmente si quieres acercarlo más.")
+                    else:
+                        st.caption(f"🏁 Con esta distribución, el cronograma cerraría el {format_f(fin_estimado)}.")
 
     if archivo_sel and df_t is not None:
         if st.button("🚀 PROCESAR CRONOGRAMA"):
