@@ -339,42 +339,42 @@ elif opcion == "📅 Cronogramas Técnicos":
     st.markdown(f"<h1 class='title-ciea'>📅 Cronogramas con Identidad CIEA</h1>", unsafe_allow_html=True)
 
     # --- FUNCIONES CRONOGRAMA ---
-    def proximo_valido(f, festivs, vaca_activa):
+    def proximo_valido(f, festivs, vaca_activa, vaca_fin_dia=10):
         cursor = f
         while True:
             if cursor.weekday() >= 5 or cursor in festivs: cursor += timedelta(days=1); continue  # 5=sábado, 6=domingo
-            if vaca_activa and ((cursor.month == 12 and cursor.day >= 15) or (cursor.month == 1) or (cursor.month == 2 and cursor.day <= 2)):
-                reanudo = date(cursor.year + (1 if cursor.month == 12 else 0), 2, 3)
+            if vaca_activa and ((cursor.month == 12 and cursor.day >= 15) or (cursor.month == 1) or (cursor.month == 2 and cursor.day <= vaca_fin_dia)):
+                reanudo = date(cursor.year + (1 if cursor.month == 12 else 0), 2, vaca_fin_dia) + timedelta(days=1)
                 cursor = reanudo + timedelta(days=(7 - reanudo.weekday()) % 7)  # cae siempre en lunes, sin importar el año
                 continue
             break
         return cursor
 
-    def sumar_dias_habiles(fecha, n, festivs, vaca_activa):
+    def sumar_dias_habiles(fecha, n, festivs, vaca_activa, vaca_fin_dia=10):
         """Avanza hasta n días hábiles consecutivos (lunes a viernes, sin festivos) desde
         'fecha'. Si las vacaciones interrumpen la racha antes de completar los n días, la
         semana termina ahí -mas corta- en vez de saltar dos meses para completarla."""
         cursor = fecha
         for _ in range(n):
-            siguiente = proximo_valido(cursor + timedelta(days=1), festivs, vaca_activa)
+            siguiente = proximo_valido(cursor + timedelta(days=1), festivs, vaca_activa, vaca_fin_dia)
             if (siguiente - cursor).days > 4:  # salto grande = vacaciones, no fin de semana/festivo suelto
                 break
             cursor = siguiente
         return cursor
 
-    def es_dia_habil(f, festivs, vaca_activa):
+    def es_dia_habil(f, festivs, vaca_activa, vaca_fin_dia=10):
         """True si 'f' es lunes-viernes, no festivo, y no cae en el receso de vacaciones."""
         if f.weekday() >= 5 or f in festivs:
             return False
-        if vaca_activa and ((f.month == 12 and f.day >= 15) or (f.month == 1) or (f.month == 2 and f.day <= 2)):
+        if vaca_activa and ((f.month == 12 and f.day >= 15) or (f.month == 1) or (f.month == 2 and f.day <= vaca_fin_dia)):
             return False
         return True
 
-    def contar_dias_habiles(inicio, fin, festivs, vaca_activa):
+    def contar_dias_habiles(inicio, fin, festivs, vaca_activa, vaca_fin_dia=10):
         """Cuenta los días hábiles entre 'inicio' y 'fin', inclusive."""
         total = 0; cursor = inicio
         while cursor <= fin:
-            if es_dia_habil(cursor, festivs, vaca_activa):
+            if es_dia_habil(cursor, festivs, vaca_activa, vaca_fin_dia):
                 total += 1
             cursor += timedelta(days=1)
         return total
@@ -402,14 +402,14 @@ elif opcion == "📅 Cronogramas Técnicos":
             i += 1
         return base
 
-    def fecha_fin_de(inicio, total_semanas, festivs, vaca_activa):
+    def fecha_fin_de(inicio, total_semanas, festivs, vaca_activa, vaca_fin_dia=10):
         """Simula el reparto semana a semana (igual que el procesamiento real) y devuelve
         la fecha en que terminaría la última semana."""
         cursor = inicio
         f_f = inicio
         for _ in range(total_semanas):
-            cursor = proximo_valido(cursor, festivs, vaca_activa)
-            f_f = sumar_dias_habiles(cursor, 4, festivs, vaca_activa)
+            cursor = proximo_valido(cursor, festivs, vaca_activa, vaca_fin_dia)
+            f_f = sumar_dias_habiles(cursor, 4, festivs, vaca_activa, vaca_fin_dia)
             cursor = f_f + timedelta(days=1)
         return f_f
 
@@ -532,6 +532,12 @@ elif opcion == "📅 Cronogramas Técnicos":
         f_ini_in = st.date_input("Inicio de Lectiva", date.today(), key="cr_date")
         inst_nom = st.text_input("Instructor Técnico", "Carlos Barrios", key="cr_inst")
         vaca_tog = st.toggle("Omitir Vacaciones", value=True)
+        vaca_fin_dia = 10
+        if vaca_tog:
+            vaca_fin_dia = st.number_input(
+                "Vacaciones: hasta qué día de febrero (arrancan siempre 15 dic)", 1, 28, 10, key="cr_vaca_fin_dia",
+                help="Varía cada año — suele ser entre el 6 y el 10 de febrero. Ajusta según el calendario del año que estés planeando."
+            )
         festivs_list = st.multiselect("Festivos:", pd.date_range(start=date.today(), periods=365).date.tolist())
 
         st.markdown("---")
@@ -572,7 +578,7 @@ elif opcion == "📅 Cronogramas Técnicos":
 
                 semanas_auto = None
                 if usar_fecha_fin and fecha_fin_obj:
-                    dias_disp = contar_dias_habiles(f_ini_in, fecha_fin_obj, festivs_list, vaca_tog)
+                    dias_disp = contar_dias_habiles(f_ini_in, fecha_fin_obj, festivs_list, vaca_tog, vaca_fin_dia)
                     semanas_disp = max(1, round(dias_disp / 5))
                     semanas_auto = repartir_semanas(pesos, semanas_disp)
                     st.caption(f"📆 {dias_disp} días hábiles disponibles ≈ {semanas_disp} semanas — repartidas según el tamaño de cada fase, editable abajo.")
@@ -590,16 +596,31 @@ elif opcion == "📅 Cronogramas Técnicos":
                 else:
                     if not tiene_horas and not usar_fecha_fin:
                         st.warning("Este programa no trae la columna 'Horas'; ingrésalas manualmente:")
+
+                    # Streamlit ignora el 3er argumento (value) de un number_input una vez que
+                    # su 'key' ya existe en session_state -> si no se hace esto, los campos se
+                    # quedan pegados en el primer valor que tuvieron y jamás reflejan un reparto
+                    # nuevo (ni el automático por fecha fin, ni un cambio de programa/pesos).
+                    # Por eso se sobreescribe session_state a mano cada vez que algo que afecta
+                    # el reparto cambia (detectado con esta 'firma').
+                    firma_reparto = (archivo_sel, usar_fecha_fin, str(fecha_fin_obj), str(f_ini_in),
+                                      vaca_tog, vaca_fin_dia, tuple(sorted(str(x) for x in festivs_list)))
+                    if st.session_state.get("_crono_firma") != firma_reparto:
+                        for f in df_t['Fase'].unique():
+                            semanas_def = semanas_auto[f] if semanas_auto else 4
+                            horas_def = pesos[f] if tiene_horas else semanas_def * HORAS_SEMANA
+                            st.session_state[f"s_{f}"] = max(1, int(semanas_def))
+                            st.session_state[f"h_{f}"] = max(1, int(horas_def))
+                        st.session_state["_crono_firma"] = firma_reparto
+
                     for f in df_t['Fase'].unique():
                         st.write(f"**Fase: {f}**")
                         c1, c2 = st.columns(2)
-                        semanas_default = semanas_auto[f] if semanas_auto else 4
-                        horas_default = pesos[f] if tiene_horas else semanas_default * HORAS_SEMANA
-                        c_sem[f] = c1.number_input("Semanas:", 1, 100, max(1, int(semanas_default)), key=f"s_{f}")
-                        c_hrs[f] = c2.number_input("Horas:", 1, 4000, max(1, int(horas_default)), key=f"h_{f}")
+                        c_sem[f] = c1.number_input("Semanas:", 1, 100, key=f"s_{f}")
+                        c_hrs[f] = c2.number_input("Horas:", 1, 4000, key=f"h_{f}")
 
                 if c_sem and sum(c_sem.values()) > 0:
-                    fin_estimado = fecha_fin_de(f_ini_in, sum(c_sem.values()), festivs_list, vaca_tog)
+                    fin_estimado = fecha_fin_de(f_ini_in, sum(c_sem.values()), festivs_list, vaca_tog, vaca_fin_dia)
                     if usar_fecha_fin and fecha_fin_obj:
                         diff = (fin_estimado - fecha_fin_obj).days
                         if abs(diff) <= 5:
@@ -618,8 +639,8 @@ elif opcion == "📅 Cronogramas Técnicos":
                 for s in range(sem):
                     count = math.ceil((s+1)*avg) - math.ceil(s*avg)
                     lote = items[idx:idx+count]; idx += count
-                    cursor = proximo_valido(cursor, festivs_list, vaca_tog)
-                    f_i_s = cursor; f_f_s = sumar_dias_habiles(f_i_s, 4, festivs_list, vaca_tog)  # semana = 5 días hábiles (L-V)
+                    cursor = proximo_valido(cursor, festivs_list, vaca_tog, vaca_fin_dia)
+                    f_i_s = cursor; f_f_s = sumar_dias_habiles(f_i_s, 4, festivs_list, vaca_tog, vaca_fin_dia)  # semana = 5 días hábiles (L-V)
                     for item in lote:
                         item.update({"Inicio": f_i_s, "Fin": f_f_s, "Instructor": asignar_instructor(item['Actividad_Aprendizaje'], inst_nom)})
                         res.append(item)
