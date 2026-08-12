@@ -342,10 +342,24 @@ elif opcion == "📅 Cronogramas Técnicos":
     def proximo_valido(f, festivs, vaca_activa):
         cursor = f
         while True:
-            if cursor.weekday() == 6 or cursor in festivs: cursor += timedelta(days=1); continue
+            if cursor.weekday() >= 5 or cursor in festivs: cursor += timedelta(days=1); continue  # 5=sábado, 6=domingo
             if vaca_activa and ((cursor.month == 12 and cursor.day >= 15) or (cursor.month == 1) or (cursor.month == 2 and cursor.day <= 2)):
-                cursor = date(cursor.year + (1 if cursor.month == 12 else 0), 2, 3); continue
+                reanudo = date(cursor.year + (1 if cursor.month == 12 else 0), 2, 3)
+                cursor = reanudo + timedelta(days=(7 - reanudo.weekday()) % 7)  # cae siempre en lunes, sin importar el año
+                continue
             break
+        return cursor
+
+    def sumar_dias_habiles(fecha, n, festivs, vaca_activa):
+        """Avanza hasta n días hábiles consecutivos (lunes a viernes, sin festivos) desde
+        'fecha'. Si las vacaciones interrumpen la racha antes de completar los n días, la
+        semana termina ahí -mas corta- en vez de saltar dos meses para completarla."""
+        cursor = fecha
+        for _ in range(n):
+            siguiente = proximo_valido(cursor + timedelta(days=1), festivs, vaca_activa)
+            if (siguiente - cursor).days > 4:  # salto grande = vacaciones, no fin de semana/festivo suelto
+                break
+            cursor = siguiente
         return cursor
 
     def generar_excel_general_pro(datos, programa, horas_dict):
@@ -517,7 +531,7 @@ elif opcion == "📅 Cronogramas Técnicos":
                     count = math.ceil((s+1)*avg) - math.ceil(s*avg)
                     lote = items[idx:idx+count]; idx += count
                     cursor = proximo_valido(cursor, festivs_list, vaca_tog)
-                    f_i_s = cursor; f_f_s = proximo_valido(f_i_s + timedelta(days=6), festivs_list, vaca_tog)
+                    f_i_s = cursor; f_f_s = sumar_dias_habiles(f_i_s, 4, festivs_list, vaca_tog)  # semana = 5 días hábiles (L-V)
                     for item in lote:
                         item.update({"Inicio": f_i_s, "Fin": f_f_s, "Instructor": asignar_instructor(item['Actividad_Aprendizaje'], inst_nom)})
                         res.append(item)
